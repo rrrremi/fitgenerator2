@@ -1,4 +1,4 @@
-import { createSearchKey, extractEquipment, determineMovementType } from './matcher';
+import { createSearchKey, extractEquipment } from './matcher';
 import { createClient } from '@/lib/supabase/server';
 
 export interface ExerciseData {
@@ -36,9 +36,8 @@ export async function findOrCreateExercise(exerciseData: ExerciseData) {
     // Determine equipment if not provided
     const equipment = exerciseData.equipment || extractEquipment(exerciseData.name);
     
-    // Determine movement type if not provided
-    const movement_type = exerciseData.movement_type || 
-      determineMovementType(exerciseData.name, exerciseData.primary_muscles);
+    // Default to compound movement type if not provided
+    const movement_type = exerciseData.movement_type || 'compound';
     
     const { data: newExercise, error: createError } = await supabase
       .from('exercises')

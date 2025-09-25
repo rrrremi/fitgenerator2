@@ -185,8 +185,8 @@ export async function POST(request: NextRequest) {
               name: exerciseData.name,
               primary_muscles: exerciseData.primary_muscles || [],
               secondary_muscles: exerciseData.secondary_muscles,
-              equipment: exerciseData.equipment,
-              movement_type: exerciseData.movement_type
+              equipment: exerciseData.equipment
+              // movement_type is defined in the type but not used in the database function
             });
             
             console.log(`${created ? 'Created' : 'Found'} exercise: ${exercise.name} (${exercise.id})`);

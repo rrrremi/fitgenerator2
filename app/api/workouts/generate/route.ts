@@ -40,14 +40,14 @@ export async function POST(request: NextRequest) {
     const requestData: WorkoutGenerationRequest = await request.json();
     
     // Validate request
-    if (!requestData.muscleFocus || requestData.muscleFocus.length === 0) {
+    if (!requestData.muscle_focus || requestData.muscle_focus.length === 0) {
       return NextResponse.json(
         { error: 'At least one muscle group must be selected' },
         { status: 400 }
       );
     }
     
-    if (!requestData.workoutFocus || requestData.workoutFocus.length === 0) {
+    if (!requestData.workout_focus || requestData.workout_focus.length === 0) {
       return NextResponse.json(
         { error: 'At least one workout focus must be selected' },
         { status: 400 }
@@ -56,7 +56,12 @@ export async function POST(request: NextRequest) {
     
     // Generate workout
     console.log('Generating workout with parameters:', requestData);
-    const result = await generateWorkout(requestData);
+    const result = await generateWorkout(
+      requestData.muscle_focus,
+      requestData.workout_focus,
+      requestData.exercise_count,
+      requestData.special_instructions || ''
+    );
     
     if (!result.success || !result.data) {
       console.error('Failed to generate workout:', result.error);
@@ -74,13 +79,13 @@ export async function POST(request: NextRequest) {
         .from('workouts')
         .insert({
           user_id: user.id,
-          name: result.data.name,
-          description: result.data.description,
+          name: "Workout " + new Date().toLocaleDateString(),
+          description: "Generated workout targeting " + requestData.muscle_focus.join(", "),
           duration_minutes: result.data.total_duration_minutes,
-          focus: requestData.workoutFocus,
-          difficulty: requestData.difficulty,
-          equipment_required: result.data.equipment_required || [],
-          muscle_groups: requestData.muscleFocus
+          focus: requestData.workout_focus,
+          difficulty: 'intermediate', // Default since it's not in the request type
+          equipment_required: result.data.equipment_needed ? [result.data.equipment_needed] : [],
+          muscle_groups: requestData.muscle_focus
         })
         .select()
         .single();
@@ -130,18 +135,17 @@ export async function POST(request: NextRequest) {
           }
           
           // Link exercise to workout
-          const promise = linkExerciseToWorkout({
-            workout_id: workout.id,
-            exercise_id: exercise.id,
-            order_index: index,
-            sets: exerciseData.sets,
-            reps: exerciseData.reps,
-            weight: exerciseData.weight,
-            rest_seconds: rest_seconds,
-            duration_seconds: exerciseData.duration_seconds,
-            notes: exerciseData.notes,
-            rationale: sanitizedRationale
-          });
+          const promise = linkExerciseToWorkout(
+            workout.id,
+            exercise.id,
+            {
+              order_index: index,
+              sets: exerciseData.sets,
+              reps: exerciseData.reps,
+              rest_seconds: rest_seconds,
+              rationale: sanitizedRationale
+            }
+          );
           
           exercisePromises.push(promise);
         }

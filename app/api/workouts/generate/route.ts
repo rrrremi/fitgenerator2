@@ -6,322 +6,187 @@ import { findOrCreateExercise, linkExerciseToWorkout, calculateWorkoutSummary } 
 
 // Rate limit: 100 generations per day per user
 const RATE_LIMIT = 100;
-const RATE_LIMIT_WINDOW_HOURS = 24;
-
-// Valid input options
-const ALLOWED_MUSCLES = ['chest', 'back', 'shoulders', 'biceps', 'triceps', 'forearms', 'neck', 'core', 'glutes', 'quads', 'hamstrings', 'calves'];
-const ALLOWED_FOCUS = ['cardio', 'hypertrophy', 'isolation', 'strength', 'speed', 'stability', 'activation', 'stretch', 'mobility', 'plyometric', 'isometric'];
+const RATE_LIMIT_WINDOW = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
 export async function POST(request: NextRequest) {
   try {
-    // Create Supabase client
     const supabase = createClient();
     
-    // Check if user is authenticated
+    // Get current user
     const { data: { user } } = await supabase.auth.getUser();
+    
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
     
-    // Parse request body
-    let body: WorkoutGenerationRequest;
-    try {
-      body = await request.json();
-    } catch (e) {
-      // If no body provided, use default values
-      body = {
-        muscle_focus: [],
-        workout_focus: ['hypertrophy'],
-        exercise_count: 4,
-        special_instructions: ''
-      };
-    }
+    // Check rate limit
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - RATE_LIMIT_WINDOW);
     
-    // Validate request body
-    const validationError = validateRequest(body);
-    if (validationError) {
-      console.error('Request validation failed:', { 
-        error: validationError, 
-        body: JSON.stringify(body)
-      });
-      return NextResponse.json({ error: validationError }, { status: 400 });
-    }
-
-    // 2. Check Rate Limit
-    const now = new Date()
-    const dayStart = new Date(now)
-    dayStart.setHours(now.getHours() - RATE_LIMIT_WINDOW_HOURS)
-
     const { count } = await supabase
       .from('workouts')
-      .select('id', { count: 'exact', head: true })
+      .select('*', { count: 'exact', head: true })
       .eq('user_id', user.id)
-      .gte('created_at', dayStart.toISOString())
-
-    if (count !== null && count >= RATE_LIMIT) {
+      .gte('created_at', yesterday.toISOString());
+    
+    if (count && count >= RATE_LIMIT) {
       return NextResponse.json(
-        { success: false, error: 'Daily limit reached. Try again tomorrow.' },
+        { error: `Rate limit exceeded. You can generate up to ${RATE_LIMIT} workouts per day.` },
         { status: 429 }
-      )
-    }
-
-    // Generate workout with user inputs
-    console.log('Attempting to generate workout with OpenAI...');
-    console.log('OpenAI API Key exists:', !!process.env.OPENAI_API_KEY);
-    console.log('OpenAI API Key prefix:', process.env.OPENAI_API_KEY?.substring(0, 7) + '...');
-    
-    // Declare result variable outside the try block so it's accessible throughout the function
-    let result;
-    
-    try {
-      result = await generateWorkout(
-        body.muscle_focus, 
-        body.workout_focus, 
-        body.exercise_count,
-        body.special_instructions,
-        false, // Not a retry
-        true   // Use exercise database prompt for enhanced exercise data
       );
-      
-      if (!result.success) {
-        console.error('Failed to generate workout:', result.error);
-
-        if (result.error && result.error.includes('does not have access to model')) {
-          return NextResponse.json(
-            {
-              success: false,
-              error: 'The configured OpenAI project cannot access the requested model. Set `OPENAI_MODEL` to a model your key can use or supply an API key with the required access.',
-            },
-            { status: 403 }
-          );
-        }
-
-        return NextResponse.json({ error: `Failed to generate workout: ${result.error}` }, { status: 500 });
-      }
-    } catch (openaiError) {
-      console.error('OpenAI API error:', openaiError);
-      return NextResponse.json({ 
-        error: 'OpenAI API error', 
-        details: openaiError instanceof Error ? openaiError.message : 'Unknown error' 
-      }, { status: 500 });
     }
-
-    // 4. Store in Database - Begin transaction
-    console.log('Starting database transaction for workout and exercises');
+    
+    // Parse request body
+    const requestData: WorkoutGenerationRequest = await request.json();
+    
+    // Validate request
+    if (!requestData.muscleFocus || requestData.muscleFocus.length === 0) {
+      return NextResponse.json(
+        { error: 'At least one muscle group must be selected' },
+        { status: 400 }
+      );
+    }
+    
+    if (!requestData.workoutFocus || requestData.workoutFocus.length === 0) {
+      return NextResponse.json(
+        { error: 'At least one workout focus must be selected' },
+        { status: 400 }
+      );
+    }
+    
+    // Generate workout
+    console.log('Generating workout with parameters:', requestData);
+    const result = await generateWorkout(requestData);
+    
+    if (!result.success || !result.data) {
+      console.error('Failed to generate workout:', result.error);
+      return NextResponse.json(
+        { error: result.error || 'Failed to generate workout' },
+        { status: 500 }
+      );
+    }
+    
+    console.log('Workout generated successfully');
     
     try {
-      // 4.1 First save the workout
-      const { data: workout, error: insertError } = await supabase
+      // Create workout in database
+      const { data: workout, error: workoutError } = await supabase
         .from('workouts')
         .insert({
           user_id: user.id,
-          total_duration_minutes: result.data!.total_duration_minutes,
-          muscle_groups_targeted: result.data!.muscle_groups_targeted,
-          joint_groups_affected: result.data!.joint_groups_affected,
-          equipment_needed: result.data!.equipment_needed,
-          workout_data: result.data!,
-          raw_ai_response: result.rawResponse,
-          ai_model: 'gpt-3.5-turbo',
-          prompt_tokens: result.usage?.promptTokens,
-          completion_tokens: result.usage?.completionTokens,
-          generation_time_ms: result.generationTimeMs,
-          parse_attempts: result.parseAttempts,
-          // Save the customization fields
-          muscle_focus: body.muscle_focus,
-          workout_focus: body.workout_focus,
-          exercise_count: body.exercise_count,
-          special_instructions: body.special_instructions
+          name: result.data.name,
+          description: result.data.description,
+          duration_minutes: result.data.total_duration_minutes,
+          focus: requestData.workoutFocus,
+          difficulty: requestData.difficulty,
+          equipment_required: result.data.equipment_required || [],
+          muscle_groups: requestData.muscleFocus
         })
-        .select('id')
+        .select()
         .single();
       
-      if (insertError) {
-        throw new Error(`Failed to insert workout: ${insertError.message}`);
+      if (workoutError) {
+        console.error('Error creating workout:', workoutError);
+        return NextResponse.json(
+          { error: 'Failed to save workout to database' },
+          { status: 500 }
+        );
       }
       
-      if (!workout || !workout.id) {
-        throw new Error('No workout ID returned from database insert');
-      }
+      console.log(`Workout created with ID: ${workout.id}`);
       
-      console.log('Successfully inserted workout with ID:', workout.id);
+      // Process exercises
+      const exercisePromises = [];
       
-      // 4.2 Try to process and save each exercise if the exercise database tables exist
       try {
-        const exerciseRecords = [];
-        
-        // Check the database schema for the workout_exercises table
-        console.log('Checking database schema for workout_exercises table...');
-        try {
-          const { data: tableInfo, error: schemaError } = await supabase
-            .rpc('get_table_info', { table_name: 'workout_exercises' });
+        // Process each exercise
+        for (let index = 0; index < result.data.exercises.length; index++) {
+          const exerciseData = result.data.exercises[index];
+          // Convert rest_time_seconds to rest_seconds for database consistency
+          const rest_seconds = exerciseData.rest_time_seconds;
           
-          if (schemaError) {
-            console.error('Error getting table info:', schemaError);
-          } else {
-            console.log('workout_exercises table schema:', tableInfo);
-          }
-        } catch (e) {
-          console.log('RPC not available, skipping schema check:', e);
-        }
-        
-        // Check if the exercises table exists by making a simple query with minimal data transfer
-        const { error: tableCheckError } = await supabase
-          .from('exercises')
-          .select('id', { count: 'exact', head: true })
-          .limit(1);
-        
-        // If the table doesn't exist, skip the exercise database integration
-        if (tableCheckError && tableCheckError.code === 'PGRST116') {
-          console.log('Exercises table does not exist, skipping exercise database integration');
-        } else {
-          // Use standard for loop instead of for...of with entries() to avoid downlevelIteration issues
-          for (let index = 0; index < result.data!.exercises.length; index++) {
-            const exerciseData = result.data!.exercises[index];
-            // Convert rest_time_seconds to rest_seconds for database consistency
-            const rest_seconds = exerciseData.rest_time_seconds;
-            
-            // Create or find the exercise in the database
-            const { exercise, created } = await findOrCreateExercise({
-              name: exerciseData.name,
-              primary_muscles: exerciseData.primary_muscles || [],
-              secondary_muscles: exerciseData.secondary_muscles,
-              equipment: exerciseData.equipment
-              // movement_type is defined in the type but not used in the database function
-            });
-            
-            console.log(`${created ? 'Created' : 'Found'} exercise: ${exercise.name} (${exercise.id})`);
-            
-            // Sanitize and limit the rationale field
-            let sanitizedRationale: string | undefined = undefined;
-            console.log('Original rationale:', exerciseData.rationale);
-            
-            try {
-              if (exerciseData.rationale) {
-                // Replace newlines with spaces, trim whitespace, and limit to 1000 chars
-                sanitizedRationale = exerciseData.rationale
-                  .replace(/[\r\n]+/g, ' ')
-                  .trim()
-                  .substring(0, 1000);
-                console.log('Sanitized rationale:', sanitizedRationale);
-              } else {
-                console.log('No rationale provided in exercise data');
-              }
-            } catch (error) {
-              console.warn('Error sanitizing rationale:', error);
-              // Continue without rationale if there's an issue
+          // Create or find the exercise in the database
+          const { exercise, created } = await findOrCreateExercise({
+            name: exerciseData.name,
+            primary_muscles: exerciseData.primary_muscles || [],
+            secondary_muscles: exerciseData.secondary_muscles,
+            equipment: exerciseData.equipment
+            // movement_type is defined in the type but not used in the database function
+          });
+          
+          console.log(`${created ? 'Created' : 'Found'} exercise: ${exercise.name} (${exercise.id})`);
+          
+          // Sanitize and limit the rationale field
+          let sanitizedRationale: string | undefined = undefined;
+          console.log('Original rationale:', exerciseData.rationale);
+          
+          try {
+            if (exerciseData.rationale) {
+              // Limit rationale to 1000 characters
+              sanitizedRationale = exerciseData.rationale.substring(0, 1000);
             }
-            
-            // Link the exercise to the workout
-            const workoutExercise = await linkExerciseToWorkout(
-              workout.id,
-              exercise.id,
-              {
-                order_index: exerciseData.order_index || index + 1,
-                sets: exerciseData.sets,
-                reps: exerciseData.reps,
-                rest_seconds: rest_seconds,
-                rationale: sanitizedRationale
-              }
-            );
-            
-            exerciseRecords.push({
-              ...exercise,
-              sets: exerciseData.sets,
-              rest_seconds: rest_seconds
-            });
+          } catch (e) {
+            console.error('Error processing rationale:', e);
           }
           
-          // 4.3 Calculate and update workout summary fields
-          const summary = calculateWorkoutSummary(exerciseRecords);
+          // Link exercise to workout
+          const promise = linkExerciseToWorkout({
+            workout_id: workout.id,
+            exercise_id: exercise.id,
+            order_index: index,
+            sets: exerciseData.sets,
+            reps: exerciseData.reps,
+            weight: exerciseData.weight,
+            rest_seconds: rest_seconds,
+            duration_seconds: exerciseData.duration_seconds,
+            notes: exerciseData.notes,
+            rationale: sanitizedRationale
+          });
           
-          // Check if the workouts table has the summary fields
-          const { error: updateError } = await supabase
-            .from('workouts')
-            .update({
-              total_sets: summary.total_sets,
-              total_exercises: summary.total_exercises,
-              estimated_duration_minutes: summary.estimated_duration_minutes,
-              primary_muscles_targeted: summary.primary_muscles_targeted,
-              equipment_needed_array: summary.equipment_needed
-            })
-            .eq('id', workout.id);
-    
-          if (updateError) {
-            console.error('Failed to update workout summary:', updateError);
-            // Continue anyway since the core data is saved
-          }
+          exercisePromises.push(promise);
         }
-      } catch (exerciseDbError) {
-        // Log the error but continue since we can still return the workout without exercise database integration
-        console.error('Error during exercise database integration:', exerciseDbError);
-        console.log('Continuing without exercise database integration');
+        
+        // Wait for all exercise links to be created
+        await Promise.all(exercisePromises);
+        console.log('All exercises linked to workout');
+        
+        // Calculate workout summary
+        await calculateWorkoutSummary(workout.id);
+        
+        // Return the workout with exercises
+        return NextResponse.json({
+          success: true,
+          workout: {
+            ...workout,
+            exercises: result.data.exercises
+          }
+        });
+      } catch (exerciseError) {
+        console.error('Error processing exercises:', exerciseError);
+        
+        // Delete the workout if exercise processing failed
+        await supabase
+          .from('workouts')
+          .delete()
+          .eq('id', workout.id);
+        
+        return NextResponse.json(
+          { error: 'Failed to process exercises' },
+          { status: 500 }
+        );
       }
-      
-      // 5. Return Success
-      console.log('Returning success response with workout ID:', workout.id);
-      return NextResponse.json({
-        success: true,
-        workoutId: workout.id
-      });
     } catch (dbError) {
-      console.error('Database operation error:', dbError);
-      console.error('Full database error details:', dbError instanceof Error ? dbError.stack : JSON.stringify(dbError));
+      console.error('Database error:', dbError);
       return NextResponse.json(
-        { success: false, error: `Failed to save workout: ${dbError instanceof Error ? dbError.message : 'Database error'}` },
+        { error: 'Failed to save workout to database' },
         { status: 500 }
       );
     }
   } catch (error) {
     console.error('Error generating workout:', error);
-    console.error('Full error details:', error instanceof Error ? error.stack : JSON.stringify(error));
-    return NextResponse.json({ 
-      error: 'Internal server error', 
-      details: error instanceof Error ? error.message : 'Unknown error' 
-    }, { status: 500 });
+    return NextResponse.json(
+      { error: 'An unexpected error occurred' },
+      { status: 500 }
+    );
   }
-}
-
-/**
- * Validate the workout generation request
- */
-function validateRequest(body: WorkoutGenerationRequest): string | null {
-  // Check muscle focus
-  if (!Array.isArray(body.muscle_focus)) {
-    return 'muscle_focus must be an array';
-  }
-  
-  if (body.muscle_focus.length > 4) {
-    return 'Maximum 4 muscle groups allowed';
-  }
-  
-  // Validate each muscle group
-  if (body.muscle_focus.length > 0 && !body.muscle_focus.every(m => ALLOWED_MUSCLES.includes(m.toLowerCase()))) {
-    return 'Invalid muscle group';
-  }
-  
-  // Check workout focus
-  if (!Array.isArray(body.workout_focus)) {
-    return 'workout_focus must be an array';
-  }
-  
-  if (body.workout_focus.length < 1 || body.workout_focus.length > 3) {
-    return 'Please select 1-3 workout focus types';
-  }
-  
-  // Validate each workout focus
-  if (!body.workout_focus.every(focus => ALLOWED_FOCUS.includes(focus.toLowerCase()))) {
-    return 'Invalid workout focus';
-  }
-  
-  // Check exercise count
-  if (typeof body.exercise_count !== 'number' || body.exercise_count < 1 || body.exercise_count > 10) {
-    return 'Exercise count must be between 1 and 10';
-  }
-  
-  // Check special instructions length
-  if (body.special_instructions && body.special_instructions.length > 140) {
-    return 'Special instructions must be 140 characters or less';
-  }
-  
-  return null;
 }
